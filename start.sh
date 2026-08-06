@@ -98,7 +98,22 @@ export PDS_BSKY_APP_VIEW_DID="${PDS_BSKY_APP_VIEW_DID:-did:web:api.bsky.app}"
 export PDS_REPORT_SERVICE_URL="${PDS_REPORT_SERVICE_URL:-https://mod.bsky.app}"
 export PDS_REPORT_SERVICE_DID="${PDS_REPORT_SERVICE_DID:-did:plc:ar7c4by46qjdydhdevvrndac}"
 export PDS_CRAWLERS="${PDS_CRAWLERS:-https://bsky.network}"
-export PDS_SERVICE_HANDLE_DOMAINS="${PDS_SERVICE_HANDLE_DOMAINS:-.${PDS_HOSTNAME}}"
+# Handle-domain suffix. The owner handle is the app's apex subdomain
+# (bluesky.<zone>), so the offered service domain must be the ZONE itself:
+# with ".<zone>", the handle "bluesky.<zone>" validates as front="bluesky"
+# (the PDS requires the label before the service domain to be 3-18 chars with
+# no dots). Using ".<hostname>" would demand a THIRD-level handle like
+# "x.bluesky.<zone>", which OpenHost can't route/TLS. Default to the zone
+# derived from PDS_HOSTNAME (strip the leading "<app>." label).
+if [[ -z "${PDS_SERVICE_HANDLE_DOMAINS:-}" ]]; then
+  if [[ -n "${ZONE}" ]]; then
+    PDS_SERVICE_HANDLE_DOMAINS=".${ZONE}"
+  else
+    # Fallback: derive the zone by dropping the first DNS label of the hostname.
+    PDS_SERVICE_HANDLE_DOMAINS=".${PDS_HOSTNAME#*.}"
+  fi
+fi
+export PDS_SERVICE_HANDLE_DOMAINS
 export LOG_ENABLED="${LOG_ENABLED:-true}"
 export PDS_RATE_LIMITS_ENABLED="${PDS_RATE_LIMITS_ENABLED:-true}"
 # The owner is auto-provisioned by bootstrap; no self-service signups.

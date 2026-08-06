@@ -93,7 +93,7 @@ Overridable via env (sensible defaults baked in):
 | `PDS_DID_PLC_URL` | `https://plc.directory` | PLC directory |
 | `PDS_BSKY_APP_VIEW_URL` | `https://api.bsky.app` | AppView the PDS proxies to |
 | `PDS_CRAWLERS` | `https://bsky.network` | Relay to request crawls from |
-| `PDS_SERVICE_HANDLE_DOMAINS` | `.bluesky.<zone>` | Offered handle suffix |
+| `PDS_SERVICE_HANDLE_DOMAINS` | `.<zone>` | Offered handle suffix (the zone, so the apex handle `bluesky.<zone>` validates) |
 
 ## Layout
 

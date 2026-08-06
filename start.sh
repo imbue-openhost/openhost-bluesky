@@ -97,7 +97,17 @@ PROXY_PORT="${PROXY_PORT}" PDS_PORT="${PDS_PORT}" BSKYWEB_PORT="${BSKYWEB_PORT}"
 pids+=("$!")
 
 log "starting PDS on :${PDS_PORT} (hostname ${PDS_HOSTNAME})"
-( cd /app/pds && exec node --enable-source-maps index.ts ) &
+# The PDS entrypoint filename differs by release (index.js on v0.4.x,
+# index.ts on newer). Pick whichever the pinned service ships.
+if [[ -f /app/pds/index.js ]]; then
+  PDS_ENTRY=index.js
+elif [[ -f /app/pds/index.ts ]]; then
+  PDS_ENTRY=index.ts
+else
+  log "ERROR: no PDS entrypoint (index.js/index.ts) found in /app/pds"
+  exit 1
+fi
+( cd /app/pds && exec node --enable-source-maps "${PDS_ENTRY}" ) &
 pids+=("$!")
 
 log "starting bskyweb UI on :${BSKYWEB_PORT}"

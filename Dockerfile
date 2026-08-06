@@ -3,7 +3,7 @@
 # Bluesky web client (bskyweb) behind a single auth-proxy on one domain.
 #
 # Pinned upstream versions (bump deliberately):
-#   PDS service:  bluesky-social/pds        @ PDS_REF
+#   PDS service:  bluesky-social/pds        @ PDS_REF (a git tag, e.g. v0.4.98)
 #   web client:   bluesky-social/social-app @ SOCIAL_APP_REF
 #
 # ---------------------------------------------------------------------------
@@ -12,7 +12,7 @@
 # ---------------------------------------------------------------------------
 FROM node:24.18-alpine3.23 AS pds-build
 
-ARG PDS_REF=v0.4
+ARG PDS_REF=v0.4.98
 RUN corepack enable
 
 ENV CGO_ENABLED=0

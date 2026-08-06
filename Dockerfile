@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 #
 # Self-hosted Bluesky for OpenHost: the AT Protocol PDS and the official
 # Bluesky web client (bskyweb) behind a single auth-proxy on one domain.

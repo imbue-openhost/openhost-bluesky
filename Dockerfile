@@ -3,34 +3,17 @@
 # Bluesky web client (bskyweb) behind a single auth-proxy on one domain.
 #
 # Pinned upstream versions (bump deliberately):
-#   PDS service:  bluesky-social/pds        @ PDS_REF (a git tag, e.g. v0.4.98)
-#   web client:   bluesky-social/social-app @ SOCIAL_APP_REF
+#   PDS image:    ghcr.io/bluesky-social/pds  @ PDS_IMAGE_TAG (official prebuilt)
+#   web client:   bluesky-social/social-app   @ SOCIAL_APP_REF
+#
+# We base the runtime on the OFFICIAL prebuilt PDS image rather than rebuilding
+# the PDS from source: that image already ships a matching Node, the compiled
+# @atproto/pds service in /app, and the goat binary, and it is what Bluesky
+# tests + publishes. Rebuilding the native deps (better-sqlite3, sharp) against
+# a mismatched Node/Alpine combo is fragile, so we avoid it.
 #
 # ---------------------------------------------------------------------------
-# Stage 1: build the PDS node service (production deps only) + the goat binary.
-# Mirrors bluesky-social/pds' own Dockerfile.
-# ---------------------------------------------------------------------------
-FROM node:24.18-alpine3.23 AS pds-build
-
-ARG PDS_REF=v0.4.98
-RUN corepack enable
-
-ENV CGO_ENABLED=0
-ENV GODEBUG="netdns=go"
-WORKDIR /tmp
-RUN apk add --no-cache git go
-RUN git clone https://github.com/bluesky-social/goat.git \
-  && cd goat && git checkout v0.2.2 && go build -o /tmp/goat-build .
-
-WORKDIR /pds-src
-RUN git clone https://github.com/bluesky-social/pds.git . \
-  && git checkout "${PDS_REF}"
-WORKDIR /pds-src/service
-RUN corepack prepare --activate
-RUN pnpm install --production --frozen-lockfile > /dev/null
-
-# ---------------------------------------------------------------------------
-# Stage 2: build the social-app web bundle (patched to default to our own host).
+# Stage 1: build the social-app web bundle (patched to default to our own host).
 # ---------------------------------------------------------------------------
 FROM ghcr.io/pnpm/pnpm:11 AS web-build
 
@@ -60,7 +43,7 @@ RUN pnpm intl:build 2>&1 | tee i18n.log \
 RUN pnpm build-web
 
 # ---------------------------------------------------------------------------
-# Stage 3: build the bskyweb Go server, embedding the web bundle from stage 2.
+# Stage 2: build the bskyweb Go server, embedding the web bundle from stage 1.
 # ---------------------------------------------------------------------------
 FROM golang:1.26-bookworm AS go-build
 WORKDIR /usr/src/social-app
@@ -74,32 +57,38 @@ RUN cd bskyweb/ && go mod download && go mod verify
 RUN cd bskyweb/ && go build -v -trimpath -tags timetzdata -o /bskyweb ./cmd/bskyweb
 
 # ---------------------------------------------------------------------------
-# Stage 4: runtime. Base on the same node alpine the PDS uses; add the
-# bskyweb binary, Python for the auth-proxy, and gosu for privilege drops.
+# Stage 3: runtime. Base on the official prebuilt PDS image (Node + @atproto/pds
+# in /app + goat) and layer in the bskyweb binary, Python for the auth-proxy,
+# and our control scripts.
 # ---------------------------------------------------------------------------
-FROM node:24.18-alpine3.23
+FROM ghcr.io/bluesky-social/pds:0.4
 
-RUN apk add --no-cache dumb-init python3 curl su-exec openssl bash tini ca-certificates
+# The PDS image is Debian-based (node:24 bookworm). Add python + openssl + curl
+# + bash for our supervisor / auth-proxy / bootstrap.
+USER root
+RUN apt-get update && apt-get install --yes --no-install-recommends \
+      python3 openssl curl bash xxd ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
-# PDS service (node app + node_modules)
-COPY --from=pds-build /pds-src/service /app/pds
-COPY --from=pds-build /tmp/goat-build /usr/local/bin/goat
-# Web UI server (self-contained Go binary with embedded assets)
+# The PDS service lives in /app in the base image; keep it and add ours under
+# /opt/openhost so we never clobber the PDS files.
 COPY --from=go-build /bskyweb /usr/local/bin/bskyweb
 
-# App control scripts
-COPY start.sh /app/start.sh
-COPY auth_proxy.py /app/auth_proxy.py
-COPY bootstrap_account.py /app/bootstrap_account.py
-RUN chmod +x /app/start.sh /app/auth_proxy.py /app/bootstrap_account.py
+WORKDIR /opt/openhost
+COPY start.sh /opt/openhost/start.sh
+COPY auth_proxy.py /opt/openhost/auth_proxy.py
+COPY bootstrap_account.py /opt/openhost/bootstrap_account.py
+RUN chmod +x /opt/openhost/start.sh /opt/openhost/auth_proxy.py /opt/openhost/bootstrap_account.py
 
 ENV NODE_ENV=production
 ENV UV_USE_IO_URING=0
 ENV PDS_PORT=3000
 ENV BSKYWEB_PORT=8100
 ENV PROXY_PORT=8080
+# Where the PDS service (index.ts/js + node_modules) lives in the base image.
+ENV PDS_SERVICE_DIR=/app
 
 EXPOSE 8080
-ENTRYPOINT ["dumb-init", "--"]
-CMD ["/app/start.sh"]
+# The base image ENTRYPOINT is `dumb-init --`; keep it for signal handling and
+# just override the command to our supervisor.
+CMD ["/opt/openhost/start.sh"]

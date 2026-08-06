@@ -93,21 +93,22 @@ pids=()
 
 log "starting auth-proxy on :${PROXY_PORT}"
 PROXY_PORT="${PROXY_PORT}" PDS_PORT="${PDS_PORT}" BSKYWEB_PORT="${BSKYWEB_PORT}" \
-  python3 /app/auth_proxy.py &
+  python3 /opt/openhost/auth_proxy.py &
 pids+=("$!")
 
 log "starting PDS on :${PDS_PORT} (hostname ${PDS_HOSTNAME})"
-# The PDS entrypoint filename differs by release (index.js on v0.4.x,
-# index.ts on newer). Pick whichever the pinned service ships.
-if [[ -f /app/pds/index.js ]]; then
-  PDS_ENTRY=index.js
-elif [[ -f /app/pds/index.ts ]]; then
+PDS_SERVICE_DIR="${PDS_SERVICE_DIR:-/app}"
+# The PDS entrypoint filename differs by release (index.js on v0.4.x tags,
+# index.ts on the rolling image). Pick whichever the base image ships.
+if [[ -f "${PDS_SERVICE_DIR}/index.ts" ]]; then
   PDS_ENTRY=index.ts
+elif [[ -f "${PDS_SERVICE_DIR}/index.js" ]]; then
+  PDS_ENTRY=index.js
 else
-  log "ERROR: no PDS entrypoint (index.js/index.ts) found in /app/pds"
+  log "ERROR: no PDS entrypoint (index.ts/index.js) found in ${PDS_SERVICE_DIR}"
   exit 1
 fi
-( cd /app/pds && exec node --enable-source-maps "${PDS_ENTRY}" ) &
+( cd "${PDS_SERVICE_DIR}" && exec node --enable-source-maps "${PDS_ENTRY}" ) &
 pids+=("$!")
 
 log "starting bskyweb UI on :${BSKYWEB_PORT}"
@@ -120,7 +121,7 @@ pids+=("$!")
 # Bootstrap the owner account once the PDS is healthy (runs in background so a
 # slow bootstrap never blocks the supervisor's wait on the core processes).
 log "scheduling owner-account bootstrap"
-python3 /app/bootstrap_account.py &
+python3 /opt/openhost/bootstrap_account.py &
 pids+=("$!")
 
 # ---------------------------------------------------------------------------

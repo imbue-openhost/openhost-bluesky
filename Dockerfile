@@ -49,7 +49,12 @@ RUN pnpm build-web
 # ---------------------------------------------------------------------------
 # Stage 2: build the bskyweb Go server, embedding the web bundle from stage 1.
 # ---------------------------------------------------------------------------
-FROM golang:1.26-bookworm AS go-build
+# Build on Alpine (musl) so the resulting binary runs on the Alpine-based PDS
+# runtime image. bskyweb uses cgo (go-sqlite3), so we need a C toolchain and a
+# static link against musl -- a glibc/bookworm build would fail with
+# "cannot execute: required file not found" on musl.
+FROM golang:1.26-alpine AS go-build
+RUN apk add --no-cache gcc musl-dev git
 WORKDIR /usr/src/social-app
 ENV GODEBUG="netdns=go"
 ENV GOOS="linux"
@@ -58,7 +63,10 @@ ENV CGO_ENABLED=1
 ENV GOEXPERIMENT="loopvar"
 COPY --from=web-build /app/bskyweb ./bskyweb
 RUN cd bskyweb/ && go mod download && go mod verify
-RUN cd bskyweb/ && go build -v -trimpath -tags timetzdata -o /bskyweb ./cmd/bskyweb
+# -linkmode external -extldflags -static produces a fully static musl binary.
+RUN cd bskyweb/ && go build -v -trimpath -tags timetzdata \
+      -ldflags '-linkmode external -extldflags "-static"' \
+      -o /bskyweb ./cmd/bskyweb
 
 # ---------------------------------------------------------------------------
 # Stage 3: runtime. Base on the official prebuilt PDS image (Node + @atproto/pds

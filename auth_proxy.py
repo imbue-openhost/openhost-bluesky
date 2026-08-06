@@ -119,10 +119,22 @@ def _backend_for(path: str) -> int:
     return PDS_PORT if _is_pds_path(path) else BSKYWEB_PORT
 
 
-def _rebuild_request_headers(headers):
-    """Rewrite Host from X-Forwarded-Host, force X-Forwarded-Proto https,
-    strip hop-by-hop headers that we manage ourselves. Preserve everything
-    else verbatim (including Upgrade/Connection for WebSockets)."""
+def _is_websocket(headers) -> bool:
+    upgrade = (_header_get(headers, "Upgrade") or "").lower()
+    connection = (_header_get(headers, "Connection") or "").lower()
+    return "websocket" in upgrade and "upgrade" in connection
+
+
+def _rebuild_request_headers(headers, force_close: bool):
+    """Rewrite Host from X-Forwarded-Host, force X-Forwarded-Proto https, and
+    (for non-WebSocket requests) force ``Connection: close`` so the upstream
+    terminates the response with a socket EOF. We proxy at the raw byte level
+    and do not parse Content-Length/chunked framing, so a keep-alive upstream
+    response would never signal completion to the pump loop and the client
+    would hang. Forcing close makes every request a clean one-shot.
+
+    WebSocket upgrades are exempt: their Upgrade/Connection headers are
+    preserved verbatim so the handshake succeeds and the tunnel stays open."""
     fwd_host = _header_get(headers, "X-Forwarded-Host")
     out = []
     seen_xfp = False
@@ -135,9 +147,16 @@ def _rebuild_request_headers(headers):
             out.append(b"X-Forwarded-Proto: https\r\n")
             seen_xfp = True
             continue
+        if k == b"connection" and force_close:
+            # Replaced with our own Connection: close below.
+            continue
+        if k in (b"keep-alive",) and force_close:
+            continue
         out.append(h)
     if not seen_xfp:
         out.append(b"X-Forwarded-Proto: https\r\n")
+    if force_close:
+        out.append(b"Connection: close\r\n")
     return out
 
 
@@ -172,7 +191,8 @@ def _send_502(conn):
 
 
 def _pump(src: socket.socket, dst: socket.socket) -> None:
-    """Copy bytes one direction until EOF, then half-close dst."""
+    """Copy bytes one direction until EOF, then half-close dst.
+    Used for WebSocket tunnels and request-body forwarding."""
     try:
         while True:
             data = src.recv(RECV_CHUNK)
@@ -186,6 +206,163 @@ def _pump(src: socket.socket, dst: socket.socket) -> None:
             dst.shutdown(socket.SHUT_WR)
         except OSError:
             pass
+
+
+def _pump_reader(reader, dst: socket.socket) -> None:
+    """Copy from a buffered file-like reader to a socket until EOF (used for the
+    client->upstream direction of a WebSocket tunnel)."""
+    try:
+        while True:
+            data = reader.read1(RECV_CHUNK) if hasattr(reader, "read1") else reader.read(RECV_CHUNK)
+            if not data:
+                break
+            dst.sendall(data)
+    except OSError:
+        pass
+    finally:
+        try:
+            dst.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+
+
+def _forward_request_body(creader, req_headers, upstream: socket.socket) -> None:
+    """Forward the request body (if any) from the client's buffered reader to
+    the upstream, honoring Content-Length / chunked framing. Returns
+    immediately for bodyless requests (GET/HEAD with no Content-Length) instead
+    of blocking on a read that would never complete for a keep-alive client."""
+    te = (_header_get(req_headers, "Transfer-Encoding") or "").lower()
+    cl = _header_get(req_headers, "Content-Length")
+
+    if "chunked" in te:
+        while True:
+            size_line = creader.readline()
+            if not size_line:
+                return
+            upstream.sendall(size_line)
+            size_str = size_line.split(b";", 1)[0].strip()
+            try:
+                size = int(size_str, 16)
+            except ValueError:
+                return
+            if size == 0:
+                while True:
+                    trailer = creader.readline()
+                    if not trailer:
+                        return
+                    upstream.sendall(trailer)
+                    if trailer in (b"\r\n", b"\n"):
+                        return
+            remaining = size + 2  # trailing CRLF
+            while remaining > 0:
+                data = creader.read(min(RECV_CHUNK, remaining))
+                if not data:
+                    return
+                upstream.sendall(data)
+                remaining -= len(data)
+    elif cl is not None:
+        try:
+            remaining = int(cl)
+        except ValueError:
+            return
+        while remaining > 0:
+            data = creader.read(min(RECV_CHUNK, remaining))
+            if not data:
+                return
+            upstream.sendall(data)
+            remaining -= len(data)
+    # else: no body -- do not read, do not block.
+
+
+def _relay_one_response(ureader, conn: socket.socket) -> None:
+    """Relay exactly one HTTP/1.x response from the upstream buffered reader to
+    the client, honoring Content-Length or chunked framing so we return as soon
+    as the response is complete (rather than waiting for the upstream to close).
+    This keeps latency low and works whether or not the upstream honors our
+    forced ``Connection: close``."""
+    status_line = ureader.readline()
+    if not status_line:
+        return
+    header_lines = []
+    while True:
+        line = ureader.readline()
+        if not line or line in (b"\r\n", b"\n"):
+            header_lines.append(b"\r\n")
+            break
+        header_lines.append(line)
+
+    # Send status line + headers to the client verbatim.
+    conn.sendall(status_line)
+    for h in header_lines:
+        conn.sendall(h)
+
+    # Determine body framing.
+    def hget(name):
+        ln = name.lower().encode()
+        for h in header_lines:
+            k, _, v = h.partition(b":")
+            if k.strip().lower() == ln:
+                return v.strip().decode("latin-1", "replace")
+        return None
+
+    # HEAD responses and 1xx/204/304 have no body.
+    status_code = 0
+    try:
+        status_code = int(status_line.split(b" ")[1])
+    except (IndexError, ValueError):
+        pass
+    if status_code in (204, 304) or (100 <= status_code < 200):
+        return
+
+    te = (hget("Transfer-Encoding") or "").lower()
+    cl = hget("Content-Length")
+
+    if "chunked" in te:
+        # Relay chunked body until the zero-length terminating chunk.
+        while True:
+            size_line = ureader.readline()
+            if not size_line:
+                return
+            conn.sendall(size_line)
+            size_str = size_line.split(b";", 1)[0].strip()
+            try:
+                size = int(size_str, 16)
+            except ValueError:
+                return
+            if size == 0:
+                # Read + relay trailing CRLF (and any trailers) until blank.
+                while True:
+                    trailer = ureader.readline()
+                    if not trailer:
+                        return
+                    conn.sendall(trailer)
+                    if trailer in (b"\r\n", b"\n"):
+                        return
+            remaining = size + 2  # include the trailing CRLF after the chunk
+            while remaining > 0:
+                data = ureader.read(min(RECV_CHUNK, remaining))
+                if not data:
+                    return
+                conn.sendall(data)
+                remaining -= len(data)
+    elif cl is not None:
+        try:
+            remaining = int(cl)
+        except ValueError:
+            remaining = 0
+        while remaining > 0:
+            data = ureader.read(min(RECV_CHUNK, remaining))
+            if not data:
+                return
+            conn.sendall(data)
+            remaining -= len(data)
+    else:
+        # No framing info: read until the upstream closes.
+        while True:
+            data = ureader.read(RECV_CHUNK)
+            if not data:
+                return
+            conn.sendall(data)
 
 
 def handle_conn(conn: socket.socket, addr) -> None:
@@ -204,7 +381,10 @@ def handle_conn(conn: socket.socket, addr) -> None:
             return
 
         backend_port = _backend_for(path)
-        new_headers = _rebuild_request_headers(headers)
+        is_ws = _is_websocket(headers)
+        # Force Connection: close for normal HTTP so the upstream EOFs the
+        # response; keep WebSocket upgrades long-lived.
+        new_headers = _rebuild_request_headers(headers, force_close=not is_ws)
 
         # Connect to the chosen backend.
         try:
@@ -222,27 +402,23 @@ def handle_conn(conn: socket.socket, addr) -> None:
             upstream.sendall(h)
         upstream.sendall(b"\r\n")
 
-        # The BufferedReader may have already pulled some body bytes off the
-        # socket while reading headers. Drain ONLY what is buffered (never
-        # block for more) before handing the raw socket to the pump loop.
-        # peek() returns already-buffered bytes without blocking; read exactly
-        # that many so nothing is left stranded in the BufferedReader.
-        buffered = b""
-        try:
-            peeked = cfile.peek(0)
-            if peeked:
-                buffered = cfile.read(len(peeked))
-        except Exception:
-            buffered = b""
-        if buffered:
-            upstream.sendall(buffered)
-
-        # Now bidirectionally stream the rest. This covers request bodies,
-        # streamed responses, chunked encoding and WebSocket upgrades alike.
-        t_up = threading.Thread(target=_pump, args=(conn, upstream), daemon=True)
-        t_up.start()
-        _pump(upstream, conn)
-        t_up.join()
+        if is_ws:
+            # WebSocket: forward whatever request bytes are buffered, then run a
+            # transparent bidirectional byte tunnel until either side closes.
+            # A daemon copies client->upstream (raw), we copy upstream->client.
+            t_up = threading.Thread(
+                target=_pump_reader, args=(cfile, upstream), daemon=True
+            )
+            t_up.start()
+            _pump(upstream, conn)
+        else:
+            # Normal HTTP: forward exactly the request body (per Content-Length
+            # / chunked) from the client's buffered reader -- crucially WITHOUT
+            # blocking when there is no body -- then relay exactly one framed
+            # response back.
+            _forward_request_body(cfile, headers, upstream)
+            ureader = upstream.makefile("rb")
+            _relay_one_response(ureader, conn)
     except OSError:
         pass
     finally:

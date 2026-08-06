@@ -1,0 +1,36 @@
+[app]
+name = "bluesky"
+version = "0.1.0"
+description = "Self-hosted Bluesky: an AT Protocol PDS plus the official web client, on one domain"
+authors = ["Andrew Laack <andrew@laack.co>"]
+
+[runtime.container]
+image = "Dockerfile"
+# The auth-proxy sidecar listens here and routes between the PDS (:3000)
+# and the bskyweb web UI (:8100).
+port = 8080
+
+[routing]
+# The auth-proxy serves a static 200 at /_healthz so cold starts don't 5xx.
+health_check = "/_healthz"
+
+# AT Protocol federation and handle resolution MUST be reachable by anonymous
+# clients and other servers (the relay/AppView crawl your repo unauthenticated,
+# handle resolution hits /.well-known/atproto-did, OAuth clients hit /oauth/*).
+# These prefixes mirror PUBLIC_PATHS in auth_proxy.py — keep them in sync.
+public_paths = [
+    "/xrpc/",
+    "/.well-known/",
+    "/oauth/",
+    "/@atproto/",
+    "/tls-check",
+    "/robots.txt",
+]
+
+[resources]
+memory_mb = 2048
+cpu_millicores = 1500
+
+[data]
+app_data = true
+app_temp_data = true

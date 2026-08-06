@@ -42,19 +42,40 @@ chmod 700 "${DATA_DIR}" || true
 # ---------------------------------------------------------------------------
 SECRETS_FILE="${DATA_DIR}/pds-secrets.env"
 
-gen_hex()  { openssl rand --hex 16; }
+gen_hex()  { openssl rand -hex 16; }
+# Extract the 32-byte private scalar from a freshly generated secp256k1 key.
+# We avoid GNU-only `head --bytes/tail --bytes` + `xxd` (busybox on Alpine
+# lacks those flags), using python3 to slice the DER (7-byte header, 32 bytes).
 gen_k256() {
   openssl ecparam --name secp256k1 --genkey --noout --outform DER \
-    | tail --bytes=+8 | head --bytes=32 | xxd --plain --cols 32
+    | python3 -c "import sys; d=sys.stdin.buffer.read(); sys.stdout.write(d[7:39].hex())"
 }
 
-if [[ ! -f "${SECRETS_FILE}" ]]; then
-  log "generating PDS secrets (first boot)"
+# Regenerate if the file is missing OR a prior boot wrote an empty/short key
+# (an earlier build produced an empty K256 key via non-portable shell tools).
+_secrets_valid() {
+  [[ -f "${SECRETS_FILE}" ]] || return 1
+  # shellcheck disable=SC1090
+  local k; k="$(grep -E '^PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX=' "${SECRETS_FILE}" | cut -d= -f2-)"
+  [[ ${#k} -eq 64 ]]
+}
+
+if ! _secrets_valid; then
+  if [[ -f "${SECRETS_FILE}" ]]; then
+    log "existing PDS secrets invalid (bad rotation key); regenerating"
+  else
+    log "generating PDS secrets (first boot)"
+  fi
   umask 077
+  K256="$(gen_k256)"
+  if [[ ${#K256} -ne 64 ]]; then
+    log "ERROR: failed to generate 32-byte PLC rotation key (got ${#K256} hex chars)"
+    exit 1
+  fi
   {
     echo "PDS_JWT_SECRET=$(gen_hex)"
     echo "PDS_ADMIN_PASSWORD=$(gen_hex)"
-    echo "PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX=$(gen_k256)"
+    echo "PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX=${K256}"
   } > "${SECRETS_FILE}"
   chmod 600 "${SECRETS_FILE}"
 else

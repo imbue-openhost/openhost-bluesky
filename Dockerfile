@@ -22,6 +22,10 @@ ENV CI=1
 ENV DEBIAN_FRONTEND=noninteractive
 ENV pnpm_config_pm_on_fail=download
 
+USER root
+RUN apt-get update && apt-get install --yes --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 RUN git clone https://github.com/bluesky-social/social-app.git . \
   && git checkout "${SOCIAL_APP_REF}"

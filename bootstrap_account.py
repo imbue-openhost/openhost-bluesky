@@ -128,6 +128,45 @@ def gen_password() -> str:
     return "".join(secrets.choice(alphabet) for _ in range(24))
 
 
+# The PDS rejects createAccount for handles whose front label is on its
+# reserved-subdomain list. The app's subdomain ("bluesky") is reserved, plus a
+# handful of other common labels an operator might rename the app to. When the
+# front label is reserved we create under a temp handle then admin-rename.
+_RESERVED_FRONT_LABELS = {
+    "bluesky",
+    "bsky",
+    "at",
+    "atp",
+    "pds",
+    "did",
+    "www",
+    "admin",
+    "api",
+    "app",
+    "owner",
+    "me",
+    "home",
+    "user",
+    "main",
+    "account",
+    "root",
+}
+
+
+def _front_label(handle: str) -> str:
+    return handle.split(".", 1)[0]
+
+
+def _front_label_is_reserved(handle: str) -> bool:
+    return _front_label(handle).lower() in _RESERVED_FRONT_LABELS
+
+
+def _temp_handle(handle: str) -> str:
+    # Replace the reserved front label with a non-reserved, deterministic one.
+    suffix = handle.split(".", 1)[1] if "." in handle else handle
+    return f"ohowner.{suffix}"
+
+
 def main() -> int:
     if not ADMIN_PASSWORD:
         log("ERROR: PDS_ADMIN_PASSWORD not set; cannot bootstrap owner account")
@@ -141,6 +180,16 @@ def main() -> int:
     handle = owner_handle()
     email = f"owner@{handle}"
     password = gen_password()
+
+    # The desired handle (bluesky.<zone>) is the app's apex subdomain, but the
+    # front label "bluesky" is on the PDS's reserved-subdomain list, so
+    # createAccount (which forbids reserved labels) rejects it. We therefore:
+    #   1. create the account with a temporary NON-reserved handle, then
+    #   2. use the admin updateAccountHandle endpoint (allowAnyValid=true, which
+    #      bypasses the reserved check) to rename it to bluesky.<zone>.
+    # This is the PDS-sanctioned path for reserved handles.
+    is_reserved_front = _front_label_is_reserved(handle)
+    create_handle = _temp_handle(handle) if is_reserved_front else handle
 
     try:
         invite = _req(
@@ -163,7 +212,7 @@ def main() -> int:
             method="POST",
             data={
                 "email": email,
-                "handle": handle,
+                "handle": create_handle,
                 "password": password,
                 "inviteCode": code,
             },
@@ -177,6 +226,23 @@ def main() -> int:
     if not did.startswith("did:"):
         log(f"ERROR: unexpected createAccount response: {acct}")
         return 1
+
+    # Step 2: rename to the reserved apex handle via the admin endpoint.
+    if create_handle != handle:
+        try:
+            _req(
+                "/xrpc/com.atproto.admin.updateAccountHandle",
+                method="POST",
+                data={"did": did, "handle": handle},
+                admin_auth=True,
+            )
+            log(f"renamed handle {create_handle} -> {handle}")
+        except urllib.error.HTTPError as e:
+            detail = e.read()[:300]
+            # Non-fatal: the account still works under the temporary handle and
+            # the owner can sign in with it. Surface it clearly.
+            log(f"WARNING: could not rename to {handle}: {e} {detail!r}")
+            handle = create_handle
 
     _write_marker(handle, did)
 

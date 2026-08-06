@@ -67,12 +67,10 @@ RUN cd bskyweb/ && go build -v -trimpath -tags timetzdata -o /bskyweb ./cmd/bsky
 # ---------------------------------------------------------------------------
 FROM ghcr.io/bluesky-social/pds:0.4
 
-# The PDS image is Debian-based (node:24 bookworm). Add python + openssl + curl
-# + bash for our supervisor / auth-proxy / bootstrap.
+# The official PDS image is Alpine-based. Add python + openssl + curl + bash
+# for our supervisor / auth-proxy / bootstrap (busybox already provides xxd).
 USER root
-RUN apt-get update && apt-get install --yes --no-install-recommends \
-      python3 openssl curl bash xxd ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache python3 openssl curl bash ca-certificates
 
 # The PDS service lives in /app in the base image; keep it and add ours under
 # /opt/openhost so we never clobber the PDS files.

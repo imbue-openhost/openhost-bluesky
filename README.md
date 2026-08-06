@@ -99,7 +99,7 @@ Overridable via env (sensible defaults baked in):
 
 ```
 openhost.toml          # manifest (port, public_paths, resources)
-Dockerfile             # 4-stage build: PDS deps, web bundle, bskyweb, runtime
+Dockerfile             # 3 stages: web bundle, bskyweb (Go), runtime on the PDS image
 patch_web_constants.sh # points the web client's default PDS at this origin
 start.sh               # supervisor: secrets, PDS, bskyweb, auth-proxy
 auth_proxy.py          # single-domain path router + header fixups

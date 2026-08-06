@@ -3,7 +3,7 @@
 # Bluesky web client (bskyweb) behind a single auth-proxy on one domain.
 #
 # Pinned upstream versions (bump deliberately):
-#   PDS image:    ghcr.io/bluesky-social/pds  @ PDS_IMAGE_TAG (official prebuilt)
+#   PDS image:    ghcr.io/bluesky-social/pds:0.4 (official prebuilt runtime base)
 #   web client:   bluesky-social/social-app   @ SOCIAL_APP_REF
 #
 # We base the runtime on the OFFICIAL prebuilt PDS image rather than rebuilding

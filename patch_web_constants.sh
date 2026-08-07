@@ -53,52 +53,46 @@ if [[ ! -f "${AA_STATE}" ]]; then
   exit 1
 fi
 
-# Use node for the injection: the web-build stage (pnpm image) ships node but
-# NOT python3. Node is guaranteed present because this whole build is a
-# node/pnpm toolchain.
-node - "${AA_STATE}" <<'NODEEOF'
-const fs = require('fs');
-const path = process.argv[2];
-const orig = fs.readFileSync(path, 'utf8');
+# Use perl for the injection: the web-build stage (pnpm image) has perl/sed but
+# NOT python3, and node is not on PATH until `pnpm install` downloads it (which
+# runs AFTER this patch). perl is always present and handles the multi-line
+# splice robustly.
+#
+# Guards (fail loud, so the Docker build stops rather than shipping a broken
+# bundle if upstream changes):
+#   - the enum members we emit must already exist in the ORIGINAL file,
+#   - the target function + its params-block close "}) {" must be found.
+if ! grep -q "OPENHOST_DISABLE_AGE_ASSURANCE" "${AA_STATE}"; then
+  if ! grep -q "AgeAssuranceAccess.Full" "${AA_STATE}"; then
+    echo "patch_web_constants: AgeAssuranceAccess.Full not found in ${AA_STATE}; aborting" >&2
+    exit 1
+  fi
+  if ! grep -q "AgeAssuranceStatus.Unknown" "${AA_STATE}"; then
+    echo "patch_web_constants: AgeAssuranceStatus.Unknown not found in ${AA_STATE}; aborting" >&2
+    exit 1
+  fi
+  if ! grep -q "function computeAgeAssuranceState({" "${AA_STATE}"; then
+    echo "patch_web_constants: computeAgeAssuranceState not found in ${AA_STATE}; aborting" >&2
+    exit 1
+  fi
 
-if (orig.includes('OPENHOST_DISABLE_AGE_ASSURANCE')) {
-  console.log('patch_web_constants: age-assurance already patched; skipping');
-  process.exit(0);
-}
+  # Slurp the whole file; insert the early-return right after the FIRST "}) {"
+  # that follows the function marker. Emit a sentinel we can verify afterwards.
+  perl -0777 -i -pe '
+    my $inj = "\n  // OPENHOST_DISABLE_AGE_ASSURANCE: self-hosted single-owner build --" .
+              "\n  // never block behind the age-assurance birthdate gate." .
+              "\n  return {" .
+              "\n    status: AgeAssuranceStatus.Unknown," .
+              "\n    access: AgeAssuranceAccess.Full," .
+              "\n  }";
+    s/(function computeAgeAssuranceState\(\{.*?\}\) \{)/$1$inj/s;
+  ' "${AA_STATE}"
 
-// Verify -- against the ORIGINAL, unmodified source -- that the enum members we
-// reference actually exist in this module. If upstream renamed/moved them this
-// fails loudly instead of emitting TypeScript that references undefined names.
-if (!orig.includes('AgeAssuranceAccess.Full')) {
-  console.error('patch_web_constants: AgeAssuranceAccess.Full not found in original; aborting');
-  process.exit(1);
-}
-if (!orig.includes('AgeAssuranceStatus.Unknown')) {
-  console.error('patch_web_constants: AgeAssuranceStatus.Unknown not found in original; aborting');
-  process.exit(1);
-}
-
-const marker = 'function computeAgeAssuranceState({';
-const idx = orig.indexOf(marker);
-if (idx === -1) {
-  console.error('patch_web_constants: computeAgeAssuranceState not found');
-  process.exit(1);
-}
-const brace = orig.indexOf('}) {', idx);
-if (brace === -1) {
-  console.error('patch_web_constants: could not locate params block end');
-  process.exit(1);
-}
-const insertAt = brace + '}) {'.length;
-
-const injection =
-  '\n  // OPENHOST_DISABLE_AGE_ASSURANCE: self-hosted single-owner build --' +
-  '\n  // never block behind the age-assurance birthdate gate.' +
-  '\n  return {' +
-  '\n    status: AgeAssuranceStatus.Unknown,' +
-  '\n    access: AgeAssuranceAccess.Full,' +
-  '\n  }';
-
-fs.writeFileSync(path, orig.slice(0, insertAt) + injection + orig.slice(insertAt));
-console.log('patch_web_constants: injected age-assurance disable early-return');
-NODEEOF
+  if ! grep -q "OPENHOST_DISABLE_AGE_ASSURANCE" "${AA_STATE}"; then
+    echo "patch_web_constants: age-assurance injection failed (marker absent after edit); aborting" >&2
+    exit 1
+  fi
+  echo "patch_web_constants: injected age-assurance disable early-return"
+else
+  echo "patch_web_constants: age-assurance already patched; skipping"
+fi

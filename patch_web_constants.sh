@@ -37,3 +37,58 @@ sed -i \
   "${CONSTANTS}"
 
 echo "patch_web_constants: patched BSKY_SERVICE -> same-origin (window.location.origin)"
+
+# ---------------------------------------------------------------------------
+# Disable the "Age Assurance" birthdate gate for this self-hosted build.
+#
+# The stock client shows a full-screen birthdate prompt to any logged-in
+# account with no birthdate set (its fallback age-assurance rule blocks such
+# accounts). This is a single-owner, self-hosted deployment, so we force the
+# computed access to Full -- the shell then never renders NoAccessScreen.
+# We inject an early return at the top of computeAgeAssuranceState().
+# ---------------------------------------------------------------------------
+AA_STATE="src/ageAssurance/state.ts"
+if [[ ! -f "${AA_STATE}" ]]; then
+  echo "patch_web_constants: ${AA_STATE} not found (upstream layout changed?)" >&2
+  exit 1
+fi
+
+python3 - "${AA_STATE}" <<'PYEOF'
+import re, sys
+path = sys.argv[1]
+src = open(path).read()
+
+# Anchor on the function signature + its destructured-params close "}) {".
+marker = "function computeAgeAssuranceState({"
+idx = src.find(marker)
+if idx == -1:
+    sys.stderr.write("patch_web_constants: computeAgeAssuranceState not found\n")
+    sys.exit(1)
+# Find the end of the destructuring param block: the first "}) {" after marker.
+brace = src.find("}) {", idx)
+if brace == -1:
+    sys.stderr.write("patch_web_constants: could not locate params block end\n")
+    sys.exit(1)
+insert_at = brace + len("}) {")
+
+if "OPENHOST_DISABLE_AGE_ASSURANCE" in src:
+    print("patch_web_constants: age-assurance already patched; skipping")
+    sys.exit(0)
+
+injection = (
+    "\n  // OPENHOST_DISABLE_AGE_ASSURANCE: self-hosted single-owner build --"
+    "\n  // never block behind the age-assurance birthdate gate."
+    "\n  return {"
+    "\n    status: AgeAssuranceStatus.Unknown,"
+    "\n    access: AgeAssuranceAccess.Full,"
+    "\n  }"
+)
+src = src[:insert_at] + injection + src[insert_at:]
+open(path, "w").write(src)
+
+# Sanity: the enums we reference must be in scope in this module.
+if "AgeAssuranceAccess" not in src or "AgeAssuranceStatus" not in src:
+    sys.stderr.write("patch_web_constants: AA enums not in scope; aborting\n")
+    sys.exit(1)
+print("patch_web_constants: injected age-assurance disable early-return")
+PYEOF

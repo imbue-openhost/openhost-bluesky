@@ -460,46 +460,60 @@ def _sso_bootstrap_page(sess, origin_host: str) -> bytes:
     if sess.get("status"):
         account["status"] = sess["status"]
     payload = json.dumps({"account": account}, separators=(",", ":"))
+    # A COMPLETE, schema-valid default root. The client's zod schema requires
+    # these top-level keys (colorMode, session, reminders, languagePrefs with
+    # its 5 subfields, requireAltTextEnabled, invites.copiedInvites,
+    # onboarding.step, mutedThreads); everything else is optional. The client
+    # does not proactively write BSKY_STORAGE on a clean boot, so we must supply
+    # a full valid object ourselves. languagePrefs is re-normalized by the
+    # client on read, so plain "en" values are fine.
+    defaults = {
+        "colorMode": "system",
+        "darkTheme": "dim",
+        "session": {"accounts": [], "currentAccount": None},
+        "reminders": {},
+        "languagePrefs": {
+            "primaryLanguage": "en",
+            "contentLanguages": ["en"],
+            "postLanguage": "en",
+            "postLanguageHistory": ["en", "ja", "pt", "de"],
+            "appLanguage": "en",
+        },
+        "requireAltTextEnabled": False,
+        "externalEmbeds": {},
+        "mutedThreads": [],
+        "invites": {"copiedInvites": []},
+        "onboarding": {"step": "Home"},
+        "hiddenPosts": [],
+        "pdsAddressHistory": [],
+    }
+    defaults_json = json.dumps(defaults, separators=(",", ":"))
     js = """
 (function(){
   var KEY='BSKY_STORAGE';
   var ACCT=%s.account;
-  function currentValid(){
-    try{
-      var r=JSON.parse(localStorage.getItem(KEY));
-      var ca=r&&r.session&&r.session.currentAccount;
-      return !!(ca&&ca.did===ACCT.did&&ca.accessJwt);
-    }catch(e){ return false; }
+  var DEFAULTS=%s;
+  function valid(root){
+    try{ var ca=root&&root.session&&root.session.currentAccount;
+         return !!(ca&&ca.did===ACCT.did&&ca.accessJwt); }catch(e){ return false; }
   }
-  function inject(){
+  var root;
+  try{ root=JSON.parse(localStorage.getItem(KEY)); }catch(e){ root=null; }
+  if(!valid(root)){
+    // Start from the existing (valid) store if present, else our complete
+    // defaults; then splice in the authenticated account.
+    if(!root||typeof root!=='object'||!root.session||!root.languagePrefs){ root=DEFAULTS; }
     try{
-      var raw=localStorage.getItem(KEY);
-      if(!raw) return false;            // app hasn't written its defaults yet
-      var root=JSON.parse(raw);
-      if(!root||!root.session) return false;
       var accts=(root.session.accounts||[]).filter(function(a){return a.did!==ACCT.did;});
       accts.push(ACCT);
       root.session.accounts=accts;
       root.session.currentAccount=ACCT;
       localStorage.setItem(KEY, JSON.stringify(root));
-      return true;
-    }catch(e){ return false; }
+    }catch(e){}
   }
-  if(currentValid()){ location.replace('/'); return; }
-  // Boot the app in a hidden iframe so it writes a complete default store; the
-  // oh_sso cookie (set on this response) makes that iframe request pass through
-  // to the app instead of re-triggering SSO.
-  var f=document.createElement('iframe');
-  f.style.display='none'; f.src='/?_ohssoboot=1';
-  document.body.appendChild(f);
-  var tries=0;
-  var t=setInterval(function(){
-    tries++;
-    if(inject()){ clearInterval(t); location.replace('/'); }
-    else if(tries>50){ clearInterval(t); location.replace('/'); } // ~10s fail-safe
-  }, 200);
+  location.replace('/');
 })();
-""" % payload
+""" % (payload, defaults_json)
     doc = (
         "<!doctype html><html><head><meta charset=utf-8>"
         "<title>Signing you in\u2026</title></head><body>"

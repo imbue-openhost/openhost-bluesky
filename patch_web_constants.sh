@@ -53,47 +53,52 @@ if [[ ! -f "${AA_STATE}" ]]; then
   exit 1
 fi
 
-python3 - "${AA_STATE}" <<'PYEOF'
-import sys
-path = sys.argv[1]
-orig = open(path).read()
+# Use node for the injection: the web-build stage (pnpm image) ships node but
+# NOT python3. Node is guaranteed present because this whole build is a
+# node/pnpm toolchain.
+node - "${AA_STATE}" <<'NODEEOF'
+const fs = require('fs');
+const path = process.argv[2];
+const orig = fs.readFileSync(path, 'utf8');
 
-if "OPENHOST_DISABLE_AGE_ASSURANCE" in orig:
-    print("patch_web_constants: age-assurance already patched; skipping")
-    sys.exit(0)
+if (orig.includes('OPENHOST_DISABLE_AGE_ASSURANCE')) {
+  console.log('patch_web_constants: age-assurance already patched; skipping');
+  process.exit(0);
+}
 
-# Verify -- against the ORIGINAL, unmodified source -- that the enum members we
-# reference actually exist in this module. If upstream renamed/moved them this
-# fails loudly rather than emitting TypeScript that references undefined names.
-# (These substrings appear in the file's own existing returns, e.g.
-# `access: AgeAssuranceAccess.Safe` and `status: AgeAssuranceStatus.Unknown`.)
-if "AgeAssuranceAccess.Full" not in orig:
-    sys.stderr.write("patch_web_constants: AgeAssuranceAccess.Full not found in original; aborting\n")
-    sys.exit(1)
-if "AgeAssuranceStatus.Unknown" not in orig:
-    sys.stderr.write("patch_web_constants: AgeAssuranceStatus.Unknown not found in original; aborting\n")
-    sys.exit(1)
+// Verify -- against the ORIGINAL, unmodified source -- that the enum members we
+// reference actually exist in this module. If upstream renamed/moved them this
+// fails loudly instead of emitting TypeScript that references undefined names.
+if (!orig.includes('AgeAssuranceAccess.Full')) {
+  console.error('patch_web_constants: AgeAssuranceAccess.Full not found in original; aborting');
+  process.exit(1);
+}
+if (!orig.includes('AgeAssuranceStatus.Unknown')) {
+  console.error('patch_web_constants: AgeAssuranceStatus.Unknown not found in original; aborting');
+  process.exit(1);
+}
 
-# Anchor on the function signature + its destructured-params close "}) {".
-marker = "function computeAgeAssuranceState({"
-idx = orig.find(marker)
-if idx == -1:
-    sys.stderr.write("patch_web_constants: computeAgeAssuranceState not found\n")
-    sys.exit(1)
-brace = orig.find("}) {", idx)
-if brace == -1:
-    sys.stderr.write("patch_web_constants: could not locate params block end\n")
-    sys.exit(1)
-insert_at = brace + len("}) {")
+const marker = 'function computeAgeAssuranceState({';
+const idx = orig.indexOf(marker);
+if (idx === -1) {
+  console.error('patch_web_constants: computeAgeAssuranceState not found');
+  process.exit(1);
+}
+const brace = orig.indexOf('}) {', idx);
+if (brace === -1) {
+  console.error('patch_web_constants: could not locate params block end');
+  process.exit(1);
+}
+const insertAt = brace + '}) {'.length;
 
-injection = (
-    "\n  // OPENHOST_DISABLE_AGE_ASSURANCE: self-hosted single-owner build --"
-    "\n  // never block behind the age-assurance birthdate gate."
-    "\n  return {"
-    "\n    status: AgeAssuranceStatus.Unknown,"
-    "\n    access: AgeAssuranceAccess.Full,"
-    "\n  }"
-)
-open(path, "w").write(orig[:insert_at] + injection + orig[insert_at:])
-print("patch_web_constants: injected age-assurance disable early-return")
-PYEOF
+const injection =
+  '\n  // OPENHOST_DISABLE_AGE_ASSURANCE: self-hosted single-owner build --' +
+  '\n  // never block behind the age-assurance birthdate gate.' +
+  '\n  return {' +
+  '\n    status: AgeAssuranceStatus.Unknown,' +
+  '\n    access: AgeAssuranceAccess.Full,' +
+  '\n  }';
+
+fs.writeFileSync(path, orig.slice(0, insertAt) + injection + orig.slice(insertAt));
+console.log('patch_web_constants: injected age-assurance disable early-return');
+NODEEOF

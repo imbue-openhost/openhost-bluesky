@@ -402,13 +402,25 @@ ok("admin xrpc needs auth", req("/xrpc/com.atproto.server.createInviteCode", "PO
 ok("getAccountInfo admin-only", req(f"/xrpc/com.atproto.admin.getAccountInfo?did={DID}")[0] in (401, 403), "")
 # CRLF injection attempt in query
 ok("CRLF in query not reflected/crash", req("/xrpc/_health?x=a%0d%0aSet-Cookie:%20evil=1")[0] in (200, 400), "")
-# huge Content-Length with tiny body should not hang forever (server should time out / reject)
+# Content-Length larger than the body sent: the server must NOT block forever.
+# It should either respond with an error or close the connection within a
+# bounded time. We assert the whole exchange completes well under the read
+# timeout (i.e. no indefinite hang) and, if a response came back, that it is a
+# 4xx rather than a 2xx (a 2xx would mean it wrongly accepted a truncated body).
+_t0 = time.time()
+_bounded = False
+_status = None
 try:
     resp = raw_tls((f"POST /xrpc/com.atproto.server.createSession HTTP/1.1\r\nHost: {HOST}\r\n"
                     f"Content-Type: application/json\r\nContent-Length: 100\r\n\r\n{{}}").encode(), read_timeout=8)
-    ok("mismatched Content-Length doesn't hang", True, status_of(resp))
+    _status = status_of(resp)
+    _bounded = (time.time() - _t0) < 8
 except Exception:
-    ok("mismatched Content-Length doesn't hang", True, "closed")
+    # Connection closed/timed out on our side within read_timeout -> also bounded.
+    _bounded = (time.time() - _t0) < 12
+ok("mismatched Content-Length completes bounded (no infinite hang)",
+   _bounded and (_status is None or 400 <= _status < 500 or _status == 0),
+   f"status={_status} elapsed={time.time()-_t0:.1f}s")
 
 print("### 17. FEDERATION / SYNC ROBUSTNESS ###")
 ok("getRepo self 200", req(f"/xrpc/com.atproto.sync.getRepo?did={DID}")[0] == 200)

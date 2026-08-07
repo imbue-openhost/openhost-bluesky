@@ -54,26 +54,37 @@ if [[ ! -f "${AA_STATE}" ]]; then
 fi
 
 python3 - "${AA_STATE}" <<'PYEOF'
-import re, sys
+import sys
 path = sys.argv[1]
-src = open(path).read()
+orig = open(path).read()
+
+if "OPENHOST_DISABLE_AGE_ASSURANCE" in orig:
+    print("patch_web_constants: age-assurance already patched; skipping")
+    sys.exit(0)
+
+# Verify -- against the ORIGINAL, unmodified source -- that the enum members we
+# reference actually exist in this module. If upstream renamed/moved them this
+# fails loudly rather than emitting TypeScript that references undefined names.
+# (These substrings appear in the file's own existing returns, e.g.
+# `access: AgeAssuranceAccess.Safe` and `status: AgeAssuranceStatus.Unknown`.)
+if "AgeAssuranceAccess.Full" not in orig:
+    sys.stderr.write("patch_web_constants: AgeAssuranceAccess.Full not found in original; aborting\n")
+    sys.exit(1)
+if "AgeAssuranceStatus.Unknown" not in orig:
+    sys.stderr.write("patch_web_constants: AgeAssuranceStatus.Unknown not found in original; aborting\n")
+    sys.exit(1)
 
 # Anchor on the function signature + its destructured-params close "}) {".
 marker = "function computeAgeAssuranceState({"
-idx = src.find(marker)
+idx = orig.find(marker)
 if idx == -1:
     sys.stderr.write("patch_web_constants: computeAgeAssuranceState not found\n")
     sys.exit(1)
-# Find the end of the destructuring param block: the first "}) {" after marker.
-brace = src.find("}) {", idx)
+brace = orig.find("}) {", idx)
 if brace == -1:
     sys.stderr.write("patch_web_constants: could not locate params block end\n")
     sys.exit(1)
 insert_at = brace + len("}) {")
-
-if "OPENHOST_DISABLE_AGE_ASSURANCE" in src:
-    print("patch_web_constants: age-assurance already patched; skipping")
-    sys.exit(0)
 
 injection = (
     "\n  // OPENHOST_DISABLE_AGE_ASSURANCE: self-hosted single-owner build --"
@@ -83,12 +94,6 @@ injection = (
     "\n    access: AgeAssuranceAccess.Full,"
     "\n  }"
 )
-src = src[:insert_at] + injection + src[insert_at:]
-open(path, "w").write(src)
-
-# Sanity: the enums we reference must be in scope in this module.
-if "AgeAssuranceAccess" not in src or "AgeAssuranceStatus" not in src:
-    sys.stderr.write("patch_web_constants: AA enums not in scope; aborting\n")
-    sys.exit(1)
+open(path, "w").write(orig[:insert_at] + injection + orig[insert_at:])
 print("patch_web_constants: injected age-assurance disable early-return")
 PYEOF

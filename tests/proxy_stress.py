@@ -159,9 +159,15 @@ ok("slow-dribbled request served", status_of(resp) == 200, resp[:40])
 resp = send_raw(f"GET {PUB} HTTP/1.1\r\n\r\n".encode())
 ok("missing Host handled (no crash)", status_of(resp) in (200, 400, 421, 302), status_of(resp) or resp[:40])
 
-# 8. Garbage request line — proxy must not hang or crash; connection closes.
+# 8. Garbage request line — proxy must not hang or crash. It should either
+# return a client error (4xx) or close the connection (empty/no valid status),
+# but must NOT return a 5xx or a success. status_of() returns 0 when there is
+# no parseable HTTP status line (connection closed / rubbish), which is
+# acceptable here.
 resp = send_raw(b"NOTAVERB / GARBAGE\r\n\r\n", read_timeout=8)
-ok("garbage request line handled", True, f"status={status_of(resp)}")
+_gs = status_of(resp)
+ok("garbage request line handled (no 5xx/2xx)",
+   _gs == 0 or (400 <= _gs < 500), f"status={_gs}")
 
 # 9. Very long URL (public path prefix) — routing must still send to PDS.
 longq = "a" * 3000

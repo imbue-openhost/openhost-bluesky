@@ -24,18 +24,26 @@ Design notes:
     the latter and forwards the internal Host otherwise) so the PDS builds
     correct absolute URLs and ``req.hostname`` resolves the owner's handle.
   * ``X-Forwarded-Proto: https`` is forced so the PDS/OAuth issuer is https.
-  * No credentials are ever read from or written to disk here. Owner sign-in
-    uses the PDS's own session (Pattern E) because federation requires the
-    XRPC surface to be publicly reachable anyway.
+  * Seamless SSO: the OpenHost owner (``X-OpenHost-Is-Owner: true``) is
+    auto-logged-in on first HTML navigation. The proxy mints a real PDS
+    session server-side from a limited, revocable SSO app-password (stored
+    0600 by the bootstrap) and returns a tiny page that seeds the web client's
+    session store, so the owner lands already signed in. The app-password
+    never reaches the browser -- only short-lived JWTs do. Anonymous visitors
+    and peer servers are unaffected (federation paths stay public).
   * ``/_healthz`` is answered locally with a static 200 so OpenHost's cold
     -start health probe never sees a 5xx while the backends are booting.
 """
 
+import html
+import json
 import os
 import socket
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 
 PROXY_PORT = int(os.environ.get("PROXY_PORT", "8080"))
 PDS_PORT = int(os.environ.get("PDS_PORT", "3000"))
@@ -43,6 +51,21 @@ BSKYWEB_PORT = int(os.environ.get("BSKYWEB_PORT", "8100"))
 
 BIND_HOST = "0.0.0.0"
 BACKEND_HOST = "127.0.0.1"
+
+# Seamless OpenHost -> Bluesky SSO.
+# When the OpenHost owner (identified by the router-stamped
+# ``X-OpenHost-Is-Owner: true`` header) opens the web UI and hasn't been
+# seeded yet (no ``oh_sso`` cookie), we mint a real PDS session server-side
+# using a limited, revocable SSO app-password and hand the browser a tiny
+# bootstrap page that writes the client's session store and reloads -- so the
+# owner lands already logged in, no password prompt.
+DATA_DIR = os.environ.get("OPENHOST_APP_DATA_DIR", "/data/app_data/bluesky")
+SSO_CRED_FILE = os.path.join(DATA_DIR, "sso-cred.json")
+SSO_COOKIE = "oh_sso"
+IS_OWNER_HEADER = "x-openhost-is-owner"
+# Public AppView the web client reads timelines from (must match the client's
+# PUBLIC_BSKY_SERVICE). The SSO session's ``service`` is our own PDS origin.
+PUBLIC_APPVIEW = "https://public.api.bsky.app"
 
 # Path prefixes routed to the PDS. Order/most-specific does not matter because
 # these are disjoint from the SPA's routes. MUST mirror openhost.toml
@@ -365,6 +388,135 @@ def _relay_one_response(ureader, conn: socket.socket) -> None:
             conn.sendall(data)
 
 
+def _is_owner(headers) -> bool:
+    return (_header_get(headers, "X-OpenHost-Is-Owner") or "").strip().lower() == "true"
+
+
+def _cookie_has(headers, name: str) -> bool:
+    cookie = _header_get(headers, "Cookie") or ""
+    for part in cookie.split(";"):
+        if part.strip().startswith(name + "="):
+            return True
+    return False
+
+
+def _accepts_html(headers) -> bool:
+    return "text/html" in (_header_get(headers, "Accept") or "").lower()
+
+
+def _load_sso_cred():
+    try:
+        with open(SSO_CRED_FILE) as f:
+            c = json.load(f)
+        if c.get("handle") and c.get("app_password"):
+            return c
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _mint_session(cred):
+    """Create a fresh PDS session from the stored SSO app-password. Returns the
+    session dict (did/handle/accessJwt/refreshJwt) or None."""
+    url = f"http://{BACKEND_HOST}:{PDS_PORT}/xrpc/com.atproto.server.createSession"
+    body = json.dumps({"identifier": cred["handle"],
+                       "password": cred["app_password"]}).encode()
+    req = urllib.request.Request(
+        url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read())
+    except (urllib.error.URLError, ValueError, OSError) as e:
+        log(f"SSO: createSession failed: {e}")
+        return None
+
+
+def _sso_bootstrap_page(sess, origin_host: str) -> bytes:
+    """HTML that seeds the Bluesky web client's persisted session store, then
+    reloads into the app -- landing the owner already logged in."""
+    service = f"https://{origin_host}"
+    account = {
+        "service": service,
+        "did": sess.get("did"),
+        "handle": sess.get("handle"),
+        "email": sess.get("email"),
+        "emailConfirmed": True,
+        "refreshJwt": sess.get("refreshJwt"),
+        "accessJwt": sess.get("accessJwt"),
+        "active": sess.get("active", True),
+        "pdsUrl": service,
+    }
+    # The client reads/writes localStorage key BSKY_STORAGE (schema: a root
+    # object with a `session` slice holding accounts + currentAccount).
+    payload = json.dumps({"account": account}, separators=(",", ":"))
+    # We merge into any existing store so we don't clobber unrelated prefs.
+    js = """
+(function(){
+  try {
+    var KEY='BSKY_STORAGE';
+    var acct=%s.account;
+    var root={};
+    try { root=JSON.parse(localStorage.getItem(KEY))||{}; } catch(e){ root={}; }
+    root.session=root.session||{accounts:[],currentAccount:undefined};
+    var accts=(root.session.accounts||[]).filter(function(a){return a.did!==acct.did;});
+    accts.push(acct);
+    root.session.accounts=accts;
+    root.session.currentAccount=acct;
+    localStorage.setItem(KEY, JSON.stringify(root));
+  } catch(e){}
+  location.replace('/');
+})();
+""" % payload
+    doc = (
+        "<!doctype html><html><head><meta charset=utf-8>"
+        "<title>Signing you in\u2026</title></head><body>"
+        "<p>Signing you in to Bluesky\u2026</p>"
+        "<script>" + js + "</script></body></html>"
+    ).encode("utf-8")
+    return doc
+
+
+def _send_sso_bootstrap(conn, sess, origin_host: str) -> None:
+    doc = _sso_bootstrap_page(sess, origin_host)
+    # Set the oh_sso cookie so we only seed once per browser (avoids loops).
+    resp = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: text/html; charset=utf-8\r\n"
+        b"Cache-Control: no-store\r\n"
+        b"Set-Cookie: " + SSO_COOKIE.encode() + b"=1; Path=/; Secure; SameSite=Lax; Max-Age=31536000\r\n"
+        b"Content-Length: " + str(len(doc)).encode() + b"\r\n"
+        b"Connection: close\r\n\r\n" + doc
+    )
+    try:
+        conn.sendall(resp)
+    except OSError:
+        pass
+
+
+def _maybe_sso(conn, path, headers) -> bool:
+    """If this is an owner's first HTML navigation to the app, seed a session
+    and return True (request handled). Otherwise return False (pass through)."""
+    p = path.split("?", 1)[0]
+    # Only intercept SPA navigations, never PDS/public/asset paths.
+    if _is_pds_path(path) or p == HEALTH_PATH or p.startswith("/static/"):
+        return False
+    if not (_is_owner(headers) and _accepts_html(headers)):
+        return False
+    if _cookie_has(headers, SSO_COOKIE):
+        return False
+    cred = _load_sso_cred()
+    if not cred:
+        return False
+    sess = _mint_session(cred)
+    if not sess or not sess.get("accessJwt"):
+        return False
+    origin_host = _header_get(headers, "X-Forwarded-Host") or _header_get(headers, "Host") or cred["handle"]
+    origin_host = origin_host.split(":", 1)[0]
+    log(f"SSO: seeding owner session for {sess.get('handle')}")
+    _send_sso_bootstrap(conn, sess, origin_host)
+    return True
+
+
 def handle_conn(conn: socket.socket, addr) -> None:
     conn.settimeout(IO_TIMEOUT)
     upstream = None
@@ -378,6 +530,11 @@ def handle_conn(conn: socket.socket, addr) -> None:
         # Local health endpoint -- never touches a backend.
         if path.split("?", 1)[0] == HEALTH_PATH:
             _send_health(conn)
+            return
+
+        # Seamless OpenHost SSO: seed the owner's Bluesky session on first
+        # HTML navigation, before handing off to the SPA.
+        if _maybe_sso(conn, path, headers):
             return
 
         backend_port = _backend_for(path)

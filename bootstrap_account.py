@@ -8,20 +8,27 @@ already exists it does nothing.
 What it does on first boot:
   1. Waits for the PDS XRPC health endpoint.
   2. Mints a single-use invite code using the admin password.
-  3. Creates the owner account with handle ``bluesky.<zone>`` (the apex app
-     domain -- the only hostname OpenHost can route + TLS-terminate for us).
-  4. Prints the generated app password to the CONTAINER LOG exactly once.
+  3. Creates the owner account whose handle is derived from the OpenHost owner
+     (``<owner-username>.<zone>`` when the app is deployed under the owner's
+     username, else the app's apex domain ``<app>.<zone>`` -- the only
+     hostnames OpenHost can route + TLS-terminate for us).
+  4. Creates a dedicated SSO app-password and writes it to a server-only 0600
+     file (``<app_data>/sso-cred.json``) so the auth-proxy can mint short-lived
+     sessions for seamless OpenHost -> Bluesky single sign-on. App passwords
+     are scoped and revocable; the account's main password is never stored.
+  5. Prints the main password to the CONTAINER LOG exactly once (for manual /
+     mobile-client login), then discards it.
 
 Credential-handling policy (see README + openhost-app skill):
-  * The account password is NOT written to any file under the app_data dir,
-    because file-browser-style apps can read that directory. It is emitted to
-    stdout (the container log), which only the OpenHost owner can read via
-    ``oh app logs bluesky``.
-  * The only on-disk marker is ``<app_data>/.owner_bootstrapped`` containing
-    the owner's handle + DID (NOT secret) so we don't recreate the account.
-  * The admin password and JWT secret live in env (start.sh generates and
-    persists them to a 0600 file under app_data that is documented as
-    sensitive); they are never echoed here.
+  * The account's MAIN password is NOT written to disk anywhere. It is emitted
+    to stdout (the container log), which only the OpenHost owner can read via
+    ``oh app logs``.
+  * The SSO app-password IS written to ``<app_data>/sso-cred.json`` (0600).
+    App passwords cannot change the account password, delete the account, or
+    manage other app-passwords, and can be revoked from the UI; this file lives
+    alongside ``pds-secrets.env`` and is documented as sensitive.
+  * ``<app_data>/.owner_bootstrapped`` contains only the owner's handle + DID
+    (NOT secret) so we don't recreate the account.
 """
 
 import json
@@ -39,13 +46,22 @@ BASE = f"http://127.0.0.1:{PDS_PORT}"
 ZONE = os.environ.get("OPENHOST_ZONE_DOMAIN", "").strip()
 APP_NAME = os.environ.get("OPENHOST_APP_NAME", "bluesky").strip() or "bluesky"
 DATA_DIR = os.environ.get("OPENHOST_APP_DATA_DIR", "/data/app_data/bluesky")
+OWNER_USERNAME = os.environ.get("OPENHOST_OWNER_USERNAME", "").strip()
 
 ADMIN_PASSWORD = os.environ.get("PDS_ADMIN_PASSWORD", "")
 
-# The public hostname the PDS serves on -- also the owner's handle.
+# The public hostname the PDS serves on. This is the app's routable subdomain
+# (<app>.<zone>) and equals the owner's federating handle.
 PDS_HOSTNAME = os.environ.get("PDS_HOSTNAME", "").strip()
 
+# Optional explicit override for the owner handle (must be a hostname that
+# resolves to this PDS to federate; on OpenHost that means the app's own
+# subdomain).
+OWNER_HANDLE_OVERRIDE = os.environ.get("BLUESKY_OWNER_HANDLE", "").strip()
+
 MARKER = os.path.join(DATA_DIR, ".owner_bootstrapped")
+# Server-only credential the auth-proxy reads to mint SSO sessions (0600).
+SSO_CRED_FILE = os.path.join(DATA_DIR, "sso-cred.json")
 
 
 def log(msg: str) -> None:
@@ -72,6 +88,30 @@ def _req(path: str, *, method="GET", data=None, admin_auth=False, timeout=15):
         return json.loads(raw)
 
 
+def _req_status(path, *, method="GET", data=None, bearer=None, timeout=15):
+    """Like _req but returns (status_code, parsed_body_or_bytes) and never
+    raises for HTTP errors."""
+    url = f"{BASE}{path}"
+    body = json.dumps(data).encode() if data is not None else None
+    headers = {"Content-Type": "application/json"}
+    if bearer:
+        headers["Authorization"] = f"Bearer {bearer}"
+    r = urllib.request.Request(url, data=body, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(r, timeout=timeout) as resp:
+            raw = resp.read()
+            try:
+                return resp.status, (json.loads(raw) if raw else {})
+            except ValueError:
+                return resp.status, raw
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        try:
+            return e.code, json.loads(raw)
+        except ValueError:
+            return e.code, raw
+
+
 def wait_for_pds(deadline_s=180) -> bool:
     start = time.time()
     while time.time() - start < deadline_s:
@@ -87,7 +127,18 @@ def wait_for_pds(deadline_s=180) -> bool:
 
 
 def owner_handle() -> str:
-    # Prefer the explicit PDS hostname; fall back to app.<zone>.
+    """The owner's federating handle.
+
+    On OpenHost only the app's own subdomain ``<app>.<zone>`` is routable and
+    TLS-covered (the zone wildcard cert is a single level: ``*.<zone>``). So
+    the handle is exactly that hostname. When the operator deploys this app
+    under their OpenHost username as the app name (``oh app deploy ... --name
+    <username>``), the app domain -- and therefore the handle -- becomes
+    ``<username>.<zone>``, giving the requested username-based handle that also
+    federates. An explicit BLUESKY_OWNER_HANDLE override wins if set.
+    """
+    if OWNER_HANDLE_OVERRIDE:
+        return OWNER_HANDLE_OVERRIDE
     if PDS_HOSTNAME:
         return PDS_HOSTNAME
     if ZONE:
@@ -165,6 +216,51 @@ def _temp_handle(handle: str) -> str:
     # Replace the reserved front label with a non-reserved, deterministic one.
     suffix = handle.split(".", 1)[1] if "." in handle else handle
     return f"ohowner.{suffix}"
+
+
+def _write_sso_cred(handle: str, did: str, app_password: str) -> None:
+    """Persist the SSO app-password (server-only, 0600) for the auth-proxy."""
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        old = os.umask(0o077)
+        try:
+            with open(SSO_CRED_FILE, "w") as f:
+                json.dump({"handle": handle, "did": did,
+                           "app_password": app_password}, f)
+            os.chmod(SSO_CRED_FILE, 0o600)
+        finally:
+            os.umask(old)
+        log("wrote SSO app-password credential (0600) for the auth-proxy")
+    except OSError as e:
+        log(f"WARNING: could not write SSO cred file: {e}")
+
+
+def ensure_sso_app_password(handle: str, did: str, main_password: str) -> None:
+    """Create a dedicated SSO app-password and persist it for the auth-proxy.
+
+    Uses the account's main password to authenticate the createAppPassword
+    call. App passwords are limited (cannot change the account password, delete
+    the account, or manage app-passwords) and are revocable from the UI.
+    """
+    if os.path.exists(SSO_CRED_FILE):
+        return
+    try:
+        st, sess = _req_status(
+            "/xrpc/com.atproto.server.createSession", method="POST",
+            data={"identifier": handle, "password": main_password})
+        if st != 200 or not isinstance(sess, dict) or not sess.get("accessJwt"):
+            log(f"WARNING: SSO session login failed ({st}); skipping SSO cred")
+            return
+        jwt = sess["accessJwt"]
+        st, ap = _req_status(
+            "/xrpc/com.atproto.server.createAppPassword", method="POST",
+            data={"name": "openhost-sso"}, bearer=jwt)
+        if st == 200 and isinstance(ap, dict) and ap.get("password"):
+            _write_sso_cred(handle, did, ap["password"])
+        else:
+            log(f"WARNING: createAppPassword failed ({st}): {str(ap)[:120]}")
+    except Exception as e:
+        log(f"WARNING: ensure_sso_app_password error: {e}")
 
 
 def main() -> int:
@@ -246,8 +342,12 @@ def main() -> int:
 
     _write_marker(handle, did)
 
+    # Create + persist the SSO app-password so the auth-proxy can seamlessly
+    # log the OpenHost owner in without a password prompt.
+    ensure_sso_app_password(handle, did, password)
+
     # Emit credentials to the container log exactly once. This is the only
-    # place the password is surfaced; it is never written to app_data.
+    # place the main password is surfaced; it is never written to app_data.
     banner = "=" * 68
     log(banner)
     log("OWNER BLUESKY ACCOUNT CREATED")
@@ -256,8 +356,10 @@ def main() -> int:
     log(f"  Email:    {email}")
     log(f"  Password: {password}")
     log(f"  DID:      {did}")
-    log("  (Sign in at the URL above. This password is shown only once,")
-    log("   here in the container log; it is NOT stored on disk.)")
+    log("  (OpenHost owners are auto-logged-in via SSO -- no password needed.")
+    log("   Use this password only for mobile/other clients. The MAIN password")
+    log("   is shown once here and is NOT stored on disk; a separate, limited")
+    log("   SSO app-password is stored 0600 for the auto-login proxy.)")
     log(banner)
     return 0
 

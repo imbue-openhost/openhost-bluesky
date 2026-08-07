@@ -34,35 +34,54 @@ client.
 
 ### Your handle
 
-Your account handle is the app's apex domain itself: **`bluesky.<zone>`**.
-Handle resolution works via `/.well-known/atproto-did` at that host, which the
-PDS answers with your DID.
+Your account handle is the app's own routable subdomain, and it **federates**
+(handle resolution works via `/.well-known/atproto-did` at that host, which the
+PDS answers with your DID):
 
-> **Multi-user limitation.** OpenHost routes and TLS-terminates exactly one
-> subdomain level per app (`bluesky.<zone>`), covered by the zone's wildcard
-> cert (`*.<zone>`). Handles like `alice.bluesky.<zone>` are a *second* level
-> and are neither routed nor covered by that cert, so additional pretty handles
-> won't resolve over HTTPS. This build is designed for a **single owner
-> account**. Extra accounts are possible but would fall back to DID-based
-> login without a resolvable handle.
+- Deployed with the default name: your handle is **`bluesky.<zone>`**.
+- **Deployed under your OpenHost username** (`oh app deploy … --name <username>`):
+  the app domain — and therefore your handle — becomes **`<username>.<zone>`**.
+  This is the way to get a username-based handle that still federates.
 
-### Auth model (Pattern E — native login)
+Why not `<username>.bluesky.<zone>`? OpenHost routes and TLS-terminates exactly
+**one** subdomain level per app, covered by the zone's wildcard cert
+(`*.<zone>`). A two-level host like `<username>.bluesky.<zone>` is neither
+routed nor covered by that cert, so it could not resolve over HTTPS for the
+network to verify. Putting the username at the single routable level
+(`<username>.<zone>`) is the correct way to get it into the handle.
 
-Because federation needs the XRPC surface to be publicly reachable, this app
-uses the PDS's **own** session rather than injecting OpenHost owner headers.
-On first boot the owner account is created automatically and its one-time
-password is printed to the container log. Sign in at `https://bluesky.<zone>/`.
+You can also force a specific handle with `BLUESKY_OWNER_HANDLE` (it must be a
+hostname that resolves to this PDS — i.e. this app's own subdomain).
+
+> **Single-owner design.** This build provisions one owner account. Additional
+> accounts are possible but a second pretty handle would need a second routable
+> subdomain, so extra accounts fall back to DID-based identity.
+
+### Auth model — seamless OpenHost SSO
+
+When you (the OpenHost owner) open the app, you are **logged in automatically**
+— no password prompt. The router stamps `X-OpenHost-Is-Owner: true` on your
+requests; on your first HTML navigation the auth-proxy mints a real PDS session
+server-side (from a limited, revocable SSO app-password created at bootstrap)
+and seeds the web client's session store, so you land already signed in. Only
+short-lived JWTs ever reach the browser; the app-password stays on the server.
+
+Anonymous visitors and peer servers are unaffected — the federation paths
+(`/xrpc`, `/.well-known`, `/oauth`) stay public, and non-owners just see the
+normal sign-in screen.
 
 ## First boot
 
-1. Deploy the app. On first start, `start.sh` generates the PDS secrets and
-   `bootstrap_account.py` creates the owner account.
-2. Read the generated password **once** from the container log:
+1. Deploy the app (optionally `--name <your-username>` for a username handle).
+   On first start, `start.sh` generates the PDS secrets, `bootstrap_account.py`
+   creates the owner account, and an SSO app-password is provisioned.
+2. Just open `https://<app>.<zone>/` — SSO logs you in automatically.
+3. For **mobile / other clients**, grab the one-time main password from the log:
    ```
-   oh app logs bluesky | grep -A8 "OWNER BLUESKY ACCOUNT CREATED"
+   oh app logs <app> | grep -A9 "OWNER BLUESKY ACCOUNT CREATED"
    ```
-3. Visit `https://bluesky.<zone>/`, and sign in with handle `bluesky.<zone>`
-   and that password. Change the password in the app afterwards if you like.
+   Sign in there with your handle and that password (or create an app password
+   in Settings).
 
 ## Federation
 
@@ -73,13 +92,17 @@ up via the AppView.
 
 ## Credential handling
 
-- The account password is **never written to disk under `app_data`** (which
-  file-browser-type apps can read). It is emitted to the container log exactly
-  once. See `bootstrap_account.py`.
-- `app_data/pds-secrets.env` (mode `0600`) **is sensitive**: it holds the JWT
-  secret, admin password, and PLC rotation key. Treat it as a secret. It is
-  the only secret-bearing file the app writes, and it is required for the PDS
-  to keep the same identity across restarts.
+- The account's **main password** is **never written to disk**. It is emitted
+  to the container log exactly once (for mobile/other-client login). See
+  `bootstrap_account.py`.
+- `app_data/pds-secrets.env` (mode `0600`) **is sensitive**: JWT secret, admin
+  password, and PLC rotation key. Required for the PDS to keep the same
+  identity across restarts.
+- `app_data/sso-cred.json` (mode `0600`) **is sensitive**: it holds a limited,
+  revocable **SSO app-password** used by the auth-proxy for auto-login. An app
+  password cannot change the account password, delete the account, or manage
+  other app-passwords, and can be revoked from Settings. Only short-lived JWTs
+  derived from it ever reach the browser.
 - `app_data/.owner_bootstrapped` holds only the owner handle + DID (not
   secret) and exists so the account isn't recreated.
 
@@ -94,6 +117,7 @@ Overridable via env (sensible defaults baked in):
 | `PDS_BSKY_APP_VIEW_URL` | `https://api.bsky.app` | AppView the PDS proxies to |
 | `PDS_CRAWLERS` | `https://bsky.network` | Relay to request crawls from |
 | `PDS_SERVICE_HANDLE_DOMAINS` | `.<zone>` | Offered handle suffix (the zone, so the apex handle `bluesky.<zone>` validates) |
+| `BLUESKY_OWNER_HANDLE` | *(app subdomain)* | Force a specific owner handle (must resolve to this PDS) |
 
 ## Layout
 

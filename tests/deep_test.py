@@ -21,8 +21,8 @@ import urllib.request
 
 ZONE = sys.argv[1]
 PW = sys.argv[2]
-B = f"https://bluesky.{ZONE}"
-HANDLE = f"bluesky.{ZONE}"
+HANDLE = (sys.argv[3] if len(sys.argv) > 3 else "bluesky") + "." + ZONE
+B = f"https://{HANDLE}"
 
 CTX = ssl.create_default_context()
 CTX.check_hostname = False

@@ -12,7 +12,7 @@ import threading
 import time
 
 ZONE = sys.argv[1]
-HOST = f"bluesky.{ZONE}"
+HOST = (sys.argv[3] if len(sys.argv)>3 else "bluesky") + "." + ZONE
 PORT = 443
 
 PASS = 0

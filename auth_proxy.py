@@ -435,38 +435,85 @@ def _sso_bootstrap_page(sess, origin_host: str) -> bytes:
     """HTML that seeds the Bluesky web client's persisted session store, then
     reloads into the app -- landing the owner already logged in."""
     service = f"https://{origin_host}"
+    # IMPORTANT: the client validates the ENTIRE BSKY_STORAGE root object with a
+    # zod schema on load; if it fails, the whole store is discarded and the
+    # login screen shows. Two traps: (1) a JSON `null` for an optional field
+    # (e.g. email) FAILS `z.string().optional()`, and (2) a partial root missing
+    # required top-level keys (languagePrefs, reminders, ...) also fails. So we
+    # (a) only include account fields we actually have (never null), and (b) let
+    # the app boot once to write a complete valid default store, then merge our
+    # account into THAT known-good object -- robust across client versions.
     account = {
         "service": service,
         "did": sess.get("did"),
         "handle": sess.get("handle"),
-        "email": sess.get("email"),
         "emailConfirmed": True,
-        "refreshJwt": sess.get("refreshJwt"),
-        "accessJwt": sess.get("accessJwt"),
-        "active": sess.get("active", True),
+        "active": bool(sess.get("active", True)),
         "pdsUrl": service,
     }
-    # The client reads/writes localStorage key BSKY_STORAGE (schema: a root
-    # object with a `session` slice holding accounts + currentAccount).
+    if sess.get("email"):
+        account["email"] = sess["email"]
+    if sess.get("accessJwt"):
+        account["accessJwt"] = sess["accessJwt"]
+    if sess.get("refreshJwt"):
+        account["refreshJwt"] = sess["refreshJwt"]
+    if sess.get("status"):
+        account["status"] = sess["status"]
     payload = json.dumps({"account": account}, separators=(",", ":"))
-    # We merge into any existing store so we don't clobber unrelated prefs.
+    # A COMPLETE, schema-valid default root. The client's zod schema requires
+    # these top-level keys (colorMode, session, reminders, languagePrefs with
+    # its 5 subfields, requireAltTextEnabled, invites.copiedInvites,
+    # onboarding.step, mutedThreads); everything else is optional. The client
+    # does not proactively write BSKY_STORAGE on a clean boot, so we must supply
+    # a full valid object ourselves. languagePrefs is re-normalized by the
+    # client on read, so plain "en" values are fine.
+    defaults = {
+        "colorMode": "system",
+        "darkTheme": "dim",
+        "session": {"accounts": [], "currentAccount": None},
+        "reminders": {},
+        "languagePrefs": {
+            "primaryLanguage": "en",
+            "contentLanguages": ["en"],
+            "postLanguage": "en",
+            "postLanguageHistory": ["en", "ja", "pt", "de"],
+            "appLanguage": "en",
+        },
+        "requireAltTextEnabled": False,
+        "externalEmbeds": {},
+        "mutedThreads": [],
+        "invites": {"copiedInvites": []},
+        "onboarding": {"step": "Home"},
+        "hiddenPosts": [],
+        "pdsAddressHistory": [],
+    }
+    defaults_json = json.dumps(defaults, separators=(",", ":"))
     js = """
 (function(){
-  try {
-    var KEY='BSKY_STORAGE';
-    var acct=%s.account;
-    var root={};
-    try { root=JSON.parse(localStorage.getItem(KEY))||{}; } catch(e){ root={}; }
-    root.session=root.session||{accounts:[],currentAccount:undefined};
-    var accts=(root.session.accounts||[]).filter(function(a){return a.did!==acct.did;});
-    accts.push(acct);
-    root.session.accounts=accts;
-    root.session.currentAccount=acct;
-    localStorage.setItem(KEY, JSON.stringify(root));
-  } catch(e){}
+  var KEY='BSKY_STORAGE';
+  var ACCT=%s.account;
+  var DEFAULTS=%s;
+  function valid(root){
+    try{ var ca=root&&root.session&&root.session.currentAccount;
+         return !!(ca&&ca.did===ACCT.did&&ca.accessJwt); }catch(e){ return false; }
+  }
+  var root;
+  try{ root=JSON.parse(localStorage.getItem(KEY)); }catch(e){ root=null; }
+  if(!valid(root)){
+    // Start from the existing (valid) store if present, else our complete
+    // defaults; then splice in the authenticated account.
+    if(!root||typeof root!=='object'||!root.session||!root.languagePrefs){ root=DEFAULTS; }
+    try{
+      var accts=(root.session.accounts||[]).filter(function(a){return a.did!==ACCT.did;});
+      accts.push(ACCT);
+      root.session.accounts=accts;
+      root.session.currentAccount=ACCT;
+      localStorage.setItem(KEY, JSON.stringify(root));
+    }catch(e){}
+  }
   location.replace('/');
 })();
-""" % payload
+""" % (payload, defaults_json)
     doc = (
         "<!doctype html><html><head><meta charset=utf-8>"
         "<title>Signing you in\u2026</title></head><body>"
@@ -478,12 +525,14 @@ def _sso_bootstrap_page(sess, origin_host: str) -> bytes:
 
 def _send_sso_bootstrap(conn, sess, origin_host: str) -> None:
     doc = _sso_bootstrap_page(sess, origin_host)
-    # Set the oh_sso cookie so we only seed once per browser (avoids loops).
+    # Short-lived cookie: only to break a reload loop, NOT to permanently
+    # suppress re-seeding. If the store was stale/rejected, the next visit (after
+    # the cookie expires) re-seeds instead of leaving the owner logged out.
     resp = (
         b"HTTP/1.1 200 OK\r\n"
         b"Content-Type: text/html; charset=utf-8\r\n"
         b"Cache-Control: no-store\r\n"
-        b"Set-Cookie: " + SSO_COOKIE.encode() + b"=1; Path=/; Secure; SameSite=Lax; Max-Age=31536000\r\n"
+        b"Set-Cookie: " + SSO_COOKIE.encode() + b"=1; Path=/; Secure; SameSite=Lax; Max-Age=120\r\n"
         b"Content-Length: " + str(len(doc)).encode() + b"\r\n"
         b"Connection: close\r\n\r\n" + doc
     )
@@ -498,7 +547,7 @@ def _maybe_sso(conn, path, headers) -> bool:
     and return True (request handled). Otherwise return False (pass through)."""
     p = path.split("?", 1)[0]
     # Only intercept SPA navigations, never PDS/public/asset paths.
-    if _is_pds_path(path) or p == HEALTH_PATH or p.startswith("/static/"):
+    if _is_pds_path(path) or p == HEALTH_PATH or p.startswith("/static/") or p.startswith("/iframe/"):
         return False
     if not (_is_owner(headers) and _accepts_html(headers)):
         return False

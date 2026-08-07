@@ -354,7 +354,7 @@ def ws_probe():
     key = base64.b64encode(os.urandom(16)).decode()
     r = socket.create_connection((HOST, 443), timeout=10)
     s = CTX.wrap_socket(r, server_hostname=HOST)
-    reqline = (f"GET /xrpc/com.atproto.sync.subscribeRepos HTTP/1.1\r\nHost: {HOST}\r\n"
+    reqline = (f"GET /xrpc/com.atproto.sync.subscribeRepos?cursor=0 HTTP/1.1\r\nHost: {HOST}\r\n"
                f"Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
                f"Sec-WebSocket-Version: 13\r\n\r\n")
     s.sendall(reqline.encode())
@@ -375,12 +375,19 @@ def ws_probe():
 
 up, nbytes = ws_probe()
 ok("firehose upgrades (101)", up)
-# generate activity then confirm frames flow
-req("/xrpc/com.atproto.repo.createRecord", "POST",
-    {"repo": DID, "collection": "app.bsky.feed.post",
-     "record": {"text": "fh " + NOW, "createdAt": NOW}}, token=JWT)
-up2, nbytes2 = ws_probe()
-ok("firehose streams frame bytes", up2 and nbytes2 >= 0, f"bytes={nbytes2}")
+# Generate activity, then require that actual frame bytes stream from the
+# firehose (a genuine data check, not just the upgrade). Retry a few times
+# since the event may land just after our probe window.
+got_bytes = 0
+for _ in range(3):
+    req("/xrpc/com.atproto.repo.createRecord", "POST",
+        {"repo": DID, "collection": "app.bsky.feed.post",
+         "record": {"text": "fh " + time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()), "createdAt": NOW}}, token=JWT)
+    up2, n = ws_probe()
+    got_bytes = max(got_bytes, n)
+    if got_bytes > 0:
+        break
+ok("firehose streams frame bytes (>0)", up2 and got_bytes > 0, f"bytes={got_bytes}")
 
 print("### 15. CACHING / STATIC (UI) ###")
 # static assets are gated by SSO; verify they at least route (302 to login) not 5xx

@@ -34,6 +34,7 @@ Credential-handling policy (see README + openhost-app skill):
 import json
 import os
 import secrets
+import sqlite3
 import string
 import sys
 import time
@@ -47,6 +48,14 @@ ZONE = os.environ.get("OPENHOST_ZONE_DOMAIN", "").strip()
 APP_NAME = os.environ.get("OPENHOST_APP_NAME", "bluesky").strip() or "bluesky"
 DATA_DIR = os.environ.get("OPENHOST_APP_DATA_DIR", "/data/app_data/bluesky")
 OWNER_USERNAME = os.environ.get("OPENHOST_OWNER_USERNAME", "").strip()
+
+# The PDS account DB (SQLite). The owner's email is a non-deliverable
+# placeholder, so we mark it confirmed directly here to avoid the client's
+# "verify your email before posting" gate on this single-owner self-hosted box.
+PDS_DATA_DIRECTORY = os.environ.get(
+    "PDS_DATA_DIRECTORY", os.path.join(DATA_DIR, "pds"))
+ACCOUNT_DB = os.environ.get(
+    "PDS_ACCOUNT_DB_LOCATION", os.path.join(PDS_DATA_DIRECTORY, "account.sqlite"))
 
 ADMIN_PASSWORD = os.environ.get("PDS_ADMIN_PASSWORD", "")
 
@@ -165,6 +174,60 @@ def already_bootstrapped() -> bool:
     return False
 
 
+def _existing_did() -> str:
+    """Best-effort read of the owner DID for an already-bootstrapped account:
+    from the marker file, else via resolveHandle."""
+    try:
+        with open(MARKER) as f:
+            did = json.load(f).get("did", "")
+        if did.startswith("did:"):
+            return did
+    except (OSError, ValueError):
+        pass
+    try:
+        out = _req(
+            f"/xrpc/com.atproto.identity.resolveHandle?handle={owner_handle()}", timeout=8)
+        if isinstance(out, dict) and out.get("did", "").startswith("did:"):
+            return out["did"]
+    except Exception:
+        pass
+    return ""
+
+
+def mark_email_confirmed(did: str) -> None:
+    """Set account.emailConfirmedAt for the owner directly in the PDS SQLite so
+    the client's 'verify your email before posting' gate never triggers. The
+    owner's email is a non-deliverable placeholder on this self-hosted box, so
+    there is no real verification to do. Idempotent + best-effort: only updates
+    when currently NULL, and never fatal (the account still works otherwise)."""
+    try:
+        if not os.path.exists(ACCOUNT_DB):
+            log(f"WARNING: account DB not found at {ACCOUNT_DB}; skipping email-confirm")
+            return
+        now = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+        conn = sqlite3.connect(ACCOUNT_DB, timeout=15)
+        try:
+            conn.execute("PRAGMA busy_timeout=15000")
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(account)")}
+            if "emailConfirmedAt" not in cols or "did" not in cols:
+                log("WARNING: account schema lacks emailConfirmedAt/did; skipping")
+                return
+            cur = conn.execute(
+                "UPDATE account SET emailConfirmedAt = ? "
+                "WHERE did = ? AND emailConfirmedAt IS NULL",
+                (now, did),
+            )
+            conn.commit()
+            if cur.rowcount > 0:
+                log(f"marked owner email confirmed ({did})")
+            else:
+                log("owner email already confirmed; nothing to do")
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        log(f"WARNING: could not mark email confirmed: {e}")
+
+
 def _write_marker(handle: str, did: str) -> None:
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
@@ -271,6 +334,12 @@ def main() -> int:
         log("ERROR: PDS did not become healthy in time")
         return 1
     if already_bootstrapped():
+        # Existing account: still reconcile the parts that must hold on every
+        # boot / for accounts created by earlier versions -- mark the owner's
+        # placeholder email confirmed (removes the "verify your email" gate).
+        did = _existing_did()
+        if did:
+            mark_email_confirmed(did)
         return 0
 
     handle = owner_handle()
@@ -341,6 +410,10 @@ def main() -> int:
             handle = create_handle
 
     _write_marker(handle, did)
+
+    # Mark the placeholder email confirmed so the client never gates posting on
+    # email verification (single-owner self-hosted box; no deliverable email).
+    mark_email_confirmed(did)
 
     # Create + persist the SSO app-password so the auth-proxy can seamlessly
     # log the OpenHost owner in without a password prompt.

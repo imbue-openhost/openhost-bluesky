@@ -74,8 +74,12 @@ normal sign-in screen.
 
 1. Deploy the app (optionally `--name <your-username>` for a username handle).
    On first start, `start.sh` generates the PDS secrets, `bootstrap_account.py`
-   creates the owner account, and an SSO app-password is provisioned.
-2. Just open `https://<app>.<zone>/` — SSO logs you in automatically.
+   creates the owner account, marks its (placeholder) email confirmed, and an
+   SSO app-password is provisioned.
+2. Just open `https://<app>.<zone>/` — SSO logs you in automatically, with no
+   birthdate/age-assurance gate and no email-verification gate (this is a
+   single-owner box; the owner email is a non-deliverable placeholder, so it is
+   marked confirmed directly in the PDS).
 3. For **mobile / other clients**, grab the one-time main password from the log:
    ```
    oh app logs <app> | grep -A9 "OWNER BLUESKY ACCOUNT CREATED"
